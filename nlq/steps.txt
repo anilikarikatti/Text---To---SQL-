@@ -1,0 +1,307 @@
+
+nlq-project/
+├── backend/
+│   ├── app/
+│   │   ├── main.py
+│   │   ├── database.py
+│   │   └── sql_generator.py
+│   ├── .env
+│   ├── .env.example
+│   └── requirements.txt
+└── frontend/                 # We'll build this later
+
+
+
+Mile stone 1 : 
+
+DB setup 
+
+mile stone 2 : 
+
+generate query 
+
+In Milestone 2, we built the basic pipeline:
+
+Natural language → LLM → SQL → PostgreSQL → Results
+
+
+Milestone 3 : 
+
+1. What are we improving?
+
+User question
+"Top 5 products by completed-order revenue"
+        |
+Retrieve relevant schema and business rules
+        |
+Generate SQL
+        |
+Validate the query
+        |
+Statement type, tables, columns, limits and permissions
+        |              |
+Valid              Invalid
+Execute safely      Diagnose and retry
+            |
+Return real results or a useful error
+
+
+
+2. Improvement A — Discover the database schema automatically
+
+Why do we need this?
+In Milestone 2, we manually wrote the schema inside sql_generator.py:
+
+
+This works for four tables. But imagine the database has 150 tables and the schema changes every week. Maintaining that string manually becomes unreliable.
+
+Instead, we can inspect PostgreSQL metadata at runtime.
+
+
+Create app/schema.py:
+
+
+
+3. Improvement B — Validate table names and SQL structure
+Our original validator checked whether the query was a SELECT, but it didn't verify that every referenced table was allowed.
+
+For example, the model could generate:
+
+SELECT * FROM employee_salary;
+
+That query is a SELECT, but employee_salary isn't an approved table.
+
+Replace app/sql_validator.py with this version:
+
+
+4. Improvement C — Let the LLM correct failed SQL
+This is where the application starts becoming more robust.
+
+Consider this question:
+Which products generated the most revenue?
+
+The LLM might accidentally generate:
+
+SELECT p.name, SUM(oi.quantity * oi.price) AS revenue
+FROM products p
+JOIN order_items oi ON oi.product_id = p.id
+GROUP BY p.name;
+
+The problem is that order_items has unit_price, not price.
+
+PostgreSQL will reject the query. Instead of immediately failing the whole request, we can feed the database error back to the LLM and ask it to correct the query.
+
+The workflow becomes:
+
+Generate → Validate → Execute → Error? → Correct → Retry
+
+We must cap the retries. Otherwise, a failing model could generate queries indefinitely, increasing latency and API cost.
+
+
+Update app/sql_generator.py
+Replace the earlier implementation with:
+
+
+
+
+2. How does it select the correct tables?
+A production system typically combines several techniques. No single technique is sufficient for every database.
+
+Technique A — Search table and column names , Like keyword search 
+
+| Table | Columns |
+| --- | --- |
+| sales\_orders | id, customer\_id, order\_date, status |
+| sales\_order\_items | order\_id, product\_id, quantity, unit\_price |
+| product\_catalog | product\_id, product\_name, category |
+| customer\_profiles | customer\_id, full\_name, city |
+| employee\_payroll | employee\_id, salary, pay\_date |
+
+
+For the question "Top products by revenue," the system searches for relevant terms such as:
+- Product: product, product_name, product_id
+- Revenue: revenue, sales, amount, unit_price
+- Time: order_date, created_at
+
+
+It will likely identify sales_order_items, product_catalog, and sales_orders as candidates.
+
+This is lexical retrieval — searching actual words in the schema metadata. It is fast and useful, but it can miss relationships when the user's terminology differs from the database terminology.
+
+For example, the user says "turnover" but the schema only mentions sales_amount.
+
+
+Technique B — Semantic search using embeddings
+
+This is where your RAG knowledge becomes useful.
+
+We convert descriptions of tables and columns into embeddings and store them in a searchable index.
+
+For example, our catalog might contain:
+
+Table: sales_order_items
+
+Description:
+Contains individual products sold in each order,
+including quantity and unit price.
+
+Columns:
+order_id: Identifies the associated order.
+product_id: Identifies the product sold.
+quantity: Number of units sold.
+unit_price: Price per unit at the time of sale.
+
+
+A user asks:
+Which items contributed the most to our turnover?
+
+Even if the database doesn't contain a column named turnover, semantic retrieval can recognize that this question is related to sales and revenue.
+
+You could use PostgreSQL with pgvector, or another vector database, to store the schema embeddings.
+
+One important distinction: the embeddings don't establish that a table is correct. They retrieve candidates. The system must still check relationships, data definitions and business rules.
+
+
+
+Technique C — Follow foreign-key relationships
+
+Suppose the system identifies sales_order_items as relevant. How does it know how to get the product name?
+
+It inspects the database's relationship metadata:
+
+
+sales_order_items.product_id
+              |
+              v
+product_catalog.product_id
+
+
+And to filter by order date and status:
+
+sales_order_items.order_id
+              |
+              v
+sales_orders.id
+
+Now it has a connected group of tables that can answer the question.
+
+This is a graph problem: tables are nodes, and foreign-key relationships are edges. The system can explore connected tables to discover the necessary join path.
+
+
+
+However, a foreign key alone doesn't define business meaning. Sometimes a database has no declared foreign keys, or it contains multiple possible paths. We must account for those cases explicitly.
+
+
+
++----------------------------------+
+| Stage 1: Build a Schema Catalog  |
+|----------------------------------|
+| Extract tables, columns, keys,   |
+| relationships, and metrics      |
++----------------------------------+
+                |
+                v
++----------------------------------+
+| Stage 2: Retrieve Candidate     |
+| Tables                          |
+|----------------------------------|
+| Keyword Search + Semantic       |
+| Retrieval                       |
++----------------------------------+
+                |
+                v
++----------------------------------+
+| Stage 3: Expand Relationship    |
+| Graph                           |
+|----------------------------------|
+| Follow Foreign Keys and         |
+| Known Join Rules                |
++----------------------------------+
+                |
+                v
++----------------------------------+
+| Stage 4: Refine Schema Selection|
+|----------------------------------|
+| LLM / Reranker selects relevant |
+| Tables, Columns, Joins, Metrics |
++----------------------------------+
+                |
+                v
++----------------------------------+
+| Stage 5: Generate and Validate  |
+| SQL                             |
+|----------------------------------|
+| Check References, Permissions,  |
+| and Execution Safety            |
++----------------------------------+
+                |
+                v
++----------------------------------+
+| Final SQL Query                 |
++----------------------------------+
+
+
+
+
+This approach is often called schema linking and schema retrieval for Text-to-SQL.
+
+
+
+NOTE :  LangGraph does not automatically make an application intelligent. It gives us a structured way to control workflow, state, branching, and retries.
+
+Milestone 4, Step 1: LangGraph State and Nodes for our Text-to-SQL application.
+
+
+state 
+
+nodes 
+
+graph 
+
+
+Our next step is to add conditional edges:
+- If execution succeeds → finish.
+- If execution fails → regenerate SQL with the error context.
+- If the retry limit is reached → stop safely.
+
+
+Conditional edge 
+
+        +------------------+
+        |   Generate SQL   |
+        +------------------+
+                 |
+                 v
+        +------------------+
+        |   Validate SQL  |
+        +------------------+
+                 |
+                 v
+        +------------------+
+        |    Execute SQL  |
+        +------------------+
+                 |
+                 v
+        +------------------+
+        |  Check the State|
+        +------------------+
+                 |
+                 v
+           +-----------+
+           |  Success? |
+           +-----------+
+             /       \
+           Yes        No
+            |          |
+            v          v
+      +----------+  +----------------------+
+      |   END    |  | Generate Corrected   |
+      +----------+  |         SQL          |
+                    +----------------------+
+                              |
+                              v
+                    +----------------------+
+                    | Validate and Execute |
+                    |         Again        |
+                    +----------------------+
+                             

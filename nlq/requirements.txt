@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+openai
+sqlalchemy
+psycopg[binary]
+python-dotenv
+sqlglot
+langgraph
